@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Union
 
 import json
 import numpy as np
+import random
 import torch
 import torch.nn.functional as F
 from scipy.sparse.csgraph import shortest_path
@@ -561,6 +562,7 @@ class SDFConditioner(Conditioner):
         voxel_path,
         noise_schedule,
         autoscale: bool = True,
+        autolength: bool = False,
         autoscale_num_residues: int = 500,
         autoscale_target_ratio: float = 0.4,
         scale_invariant: bool = False,
@@ -602,6 +604,12 @@ class SDFConditioner(Conditioner):
         self.voxel_grid = VoxelGrid(voxel_path, step, threshold)
         X_target = self.voxel_grid.X_target  # Extract xyz coordinates
         
+        if autolength:
+            target_volume = X_target.shape[0] * self.voxel_grid.voxel_size**3
+            self.autolength_min = int((target_volume+5110)/167)
+            self.autolength_max = int((target_volume+5060)/152)
+            self.autoscale_num_residues = random.randint(self.autolength_min, self.autolength_max)
+        
         if self.autoscale:
             X_target, self.shape_cutoff_D = chroma.utility.chroma.point_cloud_rescale(
                 X_target,
@@ -615,7 +623,7 @@ class SDFConditioner(Conditioner):
         if self.gw_layout:
             self._map_gw_coupling_ideal_glob(
                 X_target, 
-                num_residues=autoscale_num_residues
+                num_residues=self.autoscale_num_residues
             )
             
         X_target = torch.Tensor(X_target)
