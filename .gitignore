@@ -9,6 +9,7 @@
 *.pdb
 *.cif
 *.pk
+!2G3N.cif
 *.pt
 *.fasta
 *.pickle

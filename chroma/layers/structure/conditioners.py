@@ -17,6 +17,7 @@
 
 from typing import Optional, Tuple, Union
 
+import json
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -448,6 +449,7 @@ class ShapeConditioner(Conditioner):
 
         # Compute interatomic distances
         D_inter = self._distance(X_model, X_target)
+        self.X_target_center = X_target
 
         # Estimate Wasserstein Distance
         cost = D_inter
@@ -467,6 +469,279 @@ class ShapeConditioner(Conditioner):
         U = U + neglogp
         return X, C, O, U, t
 
+class VoxelGrid:
+    def __init__(self, voxel_path, step=1, threshold=0):
+        """Initialize VoxelGrid from JSON file using memory-efficient techniques"""
+        with open(voxel_path, "r") as f:
+            data = json.load(f)
+        
+        original_grid_size = data["gridSize"]
+        # Ensure step size divides grid size evenly
+        assert original_grid_size % step == 0, f'grid_size({original_grid_size}) should be divisible by step size({step})'
+        
+        self.step = step
+        self.grid_size = original_grid_size // step  # Integer division
+        self.voxel_size = data["voxelSize"] * step
+        self.origin = np.array([
+            data["origin"]["x"],
+            data["origin"]["y"], 
+            data["origin"]["z"]
+        ], dtype=np.float32)
+        
+        # Subsample the SDF values according to step size
+        original_sdf = np.array(data["sdfValues"], dtype=np.float32).reshape(
+            original_grid_size, original_grid_size, original_grid_size
+        )
+        self.sdf_values = original_sdf[::step, ::step, ::step]
+        
+        voxels = self._to_tensor()
+        self.X_target = voxels[voxels[:,-1] < threshold][:,:-1]
+        
+        self.X_target_center = self.X_target.mean(0, keepdim=True)
+        self.X_target = self.X_target - self.X_target_center
+        self.origin = torch.tensor(self.origin) - self.X_target_center
+    
+    def _to_tensor(self):
+        """Memory-efficient tensor conversion using numpy operations"""
+        i, j, k = np.meshgrid(
+            np.arange(0, self.grid_size),
+            np.arange(0, self.grid_size),
+            np.arange(0, self.grid_size),
+            indexing='ij'
+        )
+        
+        # Calculate coordinates taking step size into account
+        x = self.origin[0] + i * self.voxel_size
+        y = self.origin[1] + j * self.voxel_size
+        z = self.origin[2] - k * self.voxel_size
+        
+        sdf = self.sdf_values[i, j, k]
+        
+        points = np.stack([x, y, z, sdf], axis=-1)
+        return torch.from_numpy(points.reshape(-1, 4))
+    
+    def find_nearest_voxels(self, points, method='nearest'):
+        """Vectorized nearest voxel finder for batches of points, GPU friendly"""
+        batch_size, num_points, _ = points.shape
+        device = points.device
+        
+        # Move tensors to same device as points
+        origin = torch.tensor(self.origin, dtype=torch.float32, device=device)
+        voxel_size = torch.tensor(self.voxel_size, dtype=torch.float32, device=device)
+        
+        # Vectorized coordinate conversion
+        origin_expanded = origin.view(1, 1, 3).expand(batch_size, num_points, 3)
+        local_coords = (points - origin_expanded) / voxel_size
+        local_coords[:, :, 2] = -local_coords[:, :, 2]
+        
+        # Calculate indices based on method
+        if method == 'nearest':
+            indices = torch.round(local_coords)
+        else:
+            indices = torch.floor(local_coords)
+            
+        indices = indices.to(torch.int64)  # Long tensor for indexing
+        indices = torch.clamp(indices, 0, self.grid_size - 1)
+        
+        # Calculate world coordinates (centered)
+        world_coords = torch.zeros_like(points, device=device)
+        world_coords[:, :, 0] = origin_expanded[:, :, 0] + indices[:, :, 0] * voxel_size
+        world_coords[:, :, 1] = origin_expanded[:, :, 1] + indices[:, :, 1] * voxel_size
+        world_coords[:, :, 2] = origin_expanded[:, :, 2] - indices[:, :, 2] * voxel_size
+        
+        # Get SDF values
+        sdf_tensor = torch.from_numpy(self.sdf_values).to(device)
+        sdf_values = sdf_tensor[indices[:, :, 0], indices[:, :, 1], indices[:, :, 2]]
+        
+        return world_coords, sdf_values, indices
+
+class SDFConditioner(Conditioner):
+    def __init__(
+        self,
+        voxel_path,
+        noise_schedule,
+        autoscale: bool = True,
+        autoscale_num_residues: int = 500,
+        autoscale_target_ratio: float = 0.4,
+        scale_invariant: bool = False,
+        shape_loss_weight: float = 20.0,
+        shape_loss_cutoff: float = 0.0,
+        shape_cutoff_D: float = 0.01,
+        scale_max_rg_ratio: float = 1.5,
+        sinkhorn_iterations: int = 10,
+        sinkhorn_scale: float = 1.0,
+        sinkhorn_scale_gw: float = 200.0,
+        sinkhorn_iterations_gw: int = 30,
+        gw_layout: bool = True,
+        gw_layout_coefficient: float = 0.4,
+        eps: float = 1e-3,
+        debug: bool = False,
+        step = 1,
+        threshold = 0,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.noise_schedule = noise_schedule
+        self.shape_loss_weight = shape_loss_weight
+        self.shape_loss_cutoff = shape_loss_cutoff
+        self.scale_invariant = scale_invariant
+        self.shape_cutoff_D = shape_cutoff_D
+        self.scale_max_rg_ratio = scale_max_rg_ratio
+        
+        self.autoscale = autoscale
+        self.autoscale_num_residues = autoscale_num_residues
+        self.autoscale_target_ratio = autoscale_target_ratio
+        
+        self.sinkhorn_iterations = sinkhorn_iterations
+        self.sinkhorn_scale = sinkhorn_scale
+        self.sinkhorn_iterations_gw = sinkhorn_iterations_gw
+        self.sinkhorn_scale_gw = sinkhorn_scale_gw
+        self.debug = debug
+
+        # Convert voxel grid to point cloud tensor
+        self.voxel_grid = VoxelGrid(voxel_path, step, threshold)
+        X_target = self.voxel_grid.X_target  # Extract xyz coordinates
+        
+        if self.autoscale:
+            X_target, self.shape_cutoff_D = chroma.utility.chroma.point_cloud_rescale(
+                X_target,
+                self.autoscale_num_residues,
+                scale_ratio=self.autoscale_target_ratio,
+            )
+
+        self.gw_layout = gw_layout
+        self.gw_layout_coefficient = gw_layout_coefficient
+        
+        if self.gw_layout:
+            self._map_gw_coupling_ideal_glob(
+                X_target, 
+                num_residues=autoscale_num_residues
+            )
+            
+        X_target = torch.Tensor(X_target)
+        self.register_buffer("X_target", X_target[None, ...].clone().detach())
+        
+        self.D_ws = []
+        self.sdfs = []
+
+    def _distance_knn(self, X, top_k=12, max_scale=10.0):
+        """Topology distance."""
+        X_np = X.cpu().data.numpy()
+        D = np.sqrt(
+            ((X_np[:, :, np.newaxis, :] - X_np[:, np.newaxis, :, :]) ** 2).sum(-1)
+        )
+
+        # Distance cutoff
+        D_cutoff = np.mean(np.sort(D[0, :, :], axis=-1)[:, top_k])
+        D[D > D_cutoff] = max_scale * np.max(D)
+        D = shortest_path(D[0, :, :])[np.newaxis, :, :]
+        D = torch.Tensor(D).float().to(X.device)
+        return D
+
+    @torch.no_grad()
+    def _map_gw_coupling_ideal_glob(self, X_target, num_residues):
+        """Plan a layout using Gromov-Wasserstein Optimal transport"""
+
+        X_target = torch.Tensor(X_target).float().unsqueeze(0)
+        if torch.cuda.is_available():
+            X_target = X_target.to("cuda")
+
+        chain_ix = torch.arange(4 * num_residues, device=X_target.device) / 4.0
+        distance_1D = (chain_ix[None, :, None] - chain_ix[None, None, :]).abs()
+        # Scaling fit log-log to large scale single chain 6HYP
+        D_model = 7.21 * distance_1D**0.322
+        D_model = D_model / D_model.mean([1, 2], keepdims=True)
+
+        D_target = self._distance_knn(X_target)
+        D_target = D_target / D_target.mean([1, 2], keepdims=True)
+
+        T_gw, D_gw = optimal_transport.optimize_couplings_gw(
+            D_model,
+            D_target,
+            scale=self.sinkhorn_scale_gw,
+            iterations_outer=self.sinkhorn_iterations_gw,
+            iterations_inner=self.sinkhorn_iterations,
+        )
+
+        self.register_buffer("T_gw", T_gw.clone().detach())
+        return
+
+    def _distance(self, X_i, X_j):
+        dX = X_i.unsqueeze(2) - X_j.unsqueeze(1)
+        D = torch.sqrt((dX**2).sum(-1) + self.eps)
+        return D
+
+    @validate_XC()
+    def forward(
+        self,
+        X: torch.Tensor,
+        C: torch.LongTensor,
+        O: torch.Tensor,
+        U: torch.Tensor,
+        t: Union[torch.Tensor, float],
+    ) -> Tuple[torch.Tensor, torch.LongTensor, torch.Tensor, torch.Tensor, Union[torch.Tensor, float]]:
+        X_target = self.X_target
+        X_model = X.reshape([X.shape[0], -1, 3])
+        
+        num_residues = X.shape[1]
+        min_rg = 2.0 * num_residues**0.333
+        max_rg = self.scale_max_rg_ratio * 2.0 * num_residues**0.4
+        shape_cutoff_D = self.shape_cutoff_D
+
+        def _center(_X):
+            _X = _X - _X.mean(1, keepdim=True)
+            return _X
+
+        def _rg(_X):
+            _X = _X - _X.mean(1, keepdim=True)
+            rsq = _X.square().sum(2, keepdim=True)
+            rg = rsq.mean(1, keepdim=True).sqrt()
+            return rg
+
+        X_model = _center(X_model)
+        
+        if self.scale_invariant:
+            def _resize(_X, target_rg):
+                _X = _X - _X.mean(1, keepdim=True)
+                rsq = _X.square().sum(2, keepdim=True)
+                rg = rsq.mean(1, keepdim=True).sqrt()
+                return _X / rg * target_rg
+            X_model = _resize(X_model, _rg(X_target))
+
+        D_inter = self._distance(X_model, X_target)
+
+        cost = D_inter
+        T_w = optimal_transport.optimize_couplings_sinkhorn(
+            cost,
+            scale=self.sinkhorn_scale,
+            iterations=self.sinkhorn_iterations
+        )
+        # sdf potential
+        _, sdfs, _ = self.voxel_grid.find_nearest_voxels(X[:,:,0,:], method='nearest')
+        
+        # unconditional to points inside X_target
+        sdf = torch.clamp(sdfs, 0).mean(1)
+        
+        if self.gw_layout:
+            T_w = T_w + self.T_gw * self.gw_layout_coefficient
+            T_w = T_w / T_w.sum([-1, -2], keepdims=True)
+        
+        D_w = (T_w * D_inter).sum([-1, -2])
+        scale_t = self.shape_loss_weight * self.noise_schedule.SNR(t).sqrt().clamp(
+            min=1e-3,
+            max=3.0
+        )
+        
+        self.D_ws.append(D_w.detach().cpu().numpy()[0])
+        self.sdfs.append(sdf.detach().cpu().numpy()[0])
+        
+        D_w = D_w + sdf # this is better than
+        # D_w = D_w + sdf - D_w # this # gradient trick
+        
+        neglogp = scale_t * F.softplus(D_w - self.shape_loss_cutoff)
+        U = U + neglogp
+        
+        return X, C, O, U, t
 
 class ProCapConditioner(Conditioner):
     """Natural language conditioning for protein backbones.

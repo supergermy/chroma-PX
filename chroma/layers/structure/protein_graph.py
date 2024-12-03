@@ -292,7 +292,10 @@ class ProteinFeatureGraph(nn.Module):
         return
 
     def _reference_stats(self, reference_pdb):
-        X, C, _ = Protein.from_PDBID(reference_pdb).to_XCS()
+        # https://github.com/generatebio/chroma/issues/52#issuecomment-2204512877
+        file_path = '../../assets/2G3N.cif'
+        protein = Protein.from_CIF(file_path)
+        X, C, _ = protein.to_XCS()
         stats_dict = self._feature_stats(X, C)
         return stats_dict
 
