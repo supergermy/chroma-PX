@@ -220,6 +220,12 @@ protein.to_CIF("lattice_protein.cif")
 
 An attractive aspect of this conditioner framework is that it is very general, enabling both constraints (which involve operations on $x$) and restraints (which amount to changes to $U$). At the same time, generation under restraints can still be (and often is) challenging, as the resulting effective energy landscape can become arbitrarily rugged and difficult to integrate. We therefore advise caution when using and developing new conditioners or conditioner combinations. We find that inspecting diffusition trajectories (including unconstrained and denoised trajectories, $\hat{x}_t$ and $\tilde{x}_t$) can be a good tool for identifying integration challenges and defining either better conditioner forms or better sampling regimes.
 
+#### SDFConditioner server mode
+```bash
+python server_mode_inference.py
+(follow the instructions)
+```
+
 ## Citing Chroma
 
 If you use Chroma in your research, please cite:
