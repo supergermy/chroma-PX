@@ -477,11 +477,8 @@ class VoxelGrid:
             data = json.load(f)
         
         original_grid_size = data["gridSize"]
-        # Ensure step size divides grid size evenly
-        assert original_grid_size % step == 0, f'grid_size({original_grid_size}) should be divisible by step size({step})'
-        
         self.step = step
-        self.grid_size = original_grid_size // step  # Integer division
+        # self.grid_size = original_grid_size // step  # Integer division
         self.voxel_size = data["voxelSize"] * step
         self.origin = np.array([
             data["origin"]["x"],
@@ -493,6 +490,7 @@ class VoxelGrid:
         original_sdf = np.array(data["sdfValues"], dtype=np.float32).reshape(
             original_grid_size, original_grid_size, original_grid_size
         )
+        self.grid_size = original_grid_size.shape[0]
         self.sdf_values = original_sdf[::step, ::step, ::step]
         
         voxels = self._to_tensor()
