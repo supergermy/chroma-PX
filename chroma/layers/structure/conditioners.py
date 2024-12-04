@@ -490,8 +490,8 @@ class VoxelGrid:
         original_sdf = np.array(data["sdfValues"], dtype=np.float32).reshape(
             original_grid_size, original_grid_size, original_grid_size
         )
-        self.grid_size = original_grid_size.shape[0]
         self.sdf_values = original_sdf[::step, ::step, ::step]
+        self.grid_size = self.sdf_values.shape[0]
         
         voxels = self._to_tensor()
         self.X_target = voxels[voxels[:,-1] < threshold][:,:-1]
