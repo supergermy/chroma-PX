@@ -560,7 +560,6 @@ class SDFConditioner(Conditioner):
         voxel_path,
         noise_schedule,
         autoscale: bool = True,
-        autolength: bool = False,
         autoscale_num_residues: int = 500,
         autoscale_target_ratio: float = 0.4,
         scale_invariant: bool = False,
@@ -602,12 +601,6 @@ class SDFConditioner(Conditioner):
         self.voxel_grid = VoxelGrid(voxel_path, step, threshold)
         X_target = self.voxel_grid.X_target  # Extract xyz coordinates
         
-        if autolength:
-            target_volume = X_target.shape[0] * self.voxel_grid.voxel_size**3
-            self.autolength_min = int((target_volume+5110)/167)
-            self.autolength_max = int((target_volume+5060)/152)
-            self.autoscale_num_residues = random.randint(self.autolength_min, self.autolength_max)
-        
         if self.autoscale:
             X_target, self.shape_cutoff_D = chroma.utility.chroma.point_cloud_rescale(
                 X_target,
@@ -621,14 +614,12 @@ class SDFConditioner(Conditioner):
         if self.gw_layout:
             self._map_gw_coupling_ideal_glob(
                 X_target, 
-                num_residues=self.autoscale_num_residues
+                num_residues=autoscale_num_residues
             )
             
         X_target = torch.Tensor(X_target)
         self.register_buffer("X_target", X_target[None, ...].clone().detach())
         
-        self.D_ws = []
-        self.sdfs = []
 
     def _distance_knn(self, X, top_k=12, max_scale=10.0):
         """Topology distance."""
@@ -726,28 +717,23 @@ class SDFConditioner(Conditioner):
         _, sdfs, _ = self.voxel_grid.find_nearest_voxels(X[:,:,0,:], method='nearest')
         
         # unconditional to points inside X_target
-        sdf = torch.clamp(sdfs, 0).mean(1)
+        sdfs = torch.clamp(sdfs, 0, 0.2) + 1 # upto 20% boost
         
         if self.gw_layout:
             T_w = T_w + self.T_gw * self.gw_layout_coefficient
             T_w = T_w / T_w.sum([-1, -2], keepdims=True)
         
-        D_w = (T_w * D_inter).sum([-1, -2])
+        D_w = ((T_w * D_inter).sum([-1]) * sdfs.repeat_interleave(4, dim=1)).sum(-1)
         scale_t = self.shape_loss_weight * self.noise_schedule.SNR(t).sqrt().clamp(
             min=1e-3,
             max=3.0
         )
         
-        self.D_ws.append(D_w.detach().cpu().numpy()[0])
-        self.sdfs.append(sdf.detach().cpu().numpy()[0])
-        
-        D_w = D_w + sdf # this is better than
-        # D_w = D_w + sdf - D_w # this # gradient trick
-        
         neglogp = scale_t * F.softplus(D_w - self.shape_loss_cutoff)
         U = U + neglogp
         
         return X, C, O, U, t
+
 
 class ProCapConditioner(Conditioner):
     """Natural language conditioning for protein backbones.
