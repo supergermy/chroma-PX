@@ -494,10 +494,10 @@ class VoxelGrid:
         self.grid_size = self.sdf_values.shape[0]
         
         voxels = self._to_tensor()
-        self.X_target = voxels[voxels[:,-1] < threshold][:,:-1]
+        self.X_target_original = voxels[ voxels[:,-1] <= threshold ][:,:-1]
         
-        self.X_target_center = self.X_target.mean(0, keepdim=True)
-        self.X_target = self.X_target - self.X_target_center
+        self.X_target_center = self.X_target_original.mean(0, keepdim=True)
+        self.X_target = self.X_target_original - self.X_target_center
         self.origin = torch.tensor(self.origin) - self.X_target_center
     
     def _to_tensor(self):
@@ -531,7 +531,7 @@ class VoxelGrid:
         # Vectorized coordinate conversion
         origin_expanded = origin.view(1, 1, 3).expand(batch_size, num_points, 3)
         local_coords = (points - origin_expanded) / voxel_size
-        local_coords[:, :, 2] = -local_coords[:, :, 2]
+        local_coords[:, :, 2] = -local_coords[:, :, 2] # i cant remember why...
         
         # Calculate indices based on method
         if method == 'nearest':
@@ -559,7 +559,8 @@ class SDFConditioner(Conditioner):
         self,
         voxel_path,
         noise_schedule,
-        autoscale: bool = True,
+        autoscale: bool = False,
+        autolength: bool = False,
         autoscale_num_residues: int = 500,
         autoscale_target_ratio: float = 0.4,
         scale_invariant: bool = False,
@@ -596,10 +597,16 @@ class SDFConditioner(Conditioner):
         self.sinkhorn_iterations_gw = sinkhorn_iterations_gw
         self.sinkhorn_scale_gw = sinkhorn_scale_gw
         self.debug = debug
-
+        
         # Convert voxel grid to point cloud tensor
         self.voxel_grid = VoxelGrid(voxel_path, step, threshold)
         X_target = self.voxel_grid.X_target  # Extract xyz coordinates
+        
+        if autolength:
+            target_volume = X_target.shape[0] * self.voxel_grid.voxel_size**3
+            self.autolength_min = int((target_volume+5110)/167)
+            self.autolength_max = int((target_volume+5060)/152)
+            self.autoscale_num_residues = random.randint(self.autolength_min, self.autolength_max)
         
         if self.autoscale:
             X_target, self.shape_cutoff_D = chroma.utility.chroma.point_cloud_rescale(
@@ -607,19 +614,20 @@ class SDFConditioner(Conditioner):
                 self.autoscale_num_residues,
                 scale_ratio=self.autoscale_target_ratio,
             )
-
+            
         self.gw_layout = gw_layout
         self.gw_layout_coefficient = gw_layout_coefficient
         
         if self.gw_layout:
             self._map_gw_coupling_ideal_glob(
                 X_target, 
-                num_residues=autoscale_num_residues
+                num_residues=self.autoscale_num_residues
             )
             
         X_target = torch.Tensor(X_target)
         self.register_buffer("X_target", X_target[None, ...].clone().detach())
-        
+        self.sdfs = []
+        self.D_ws = []
 
     def _distance_knn(self, X, top_k=12, max_scale=10.0):
         """Topology distance."""
@@ -715,6 +723,8 @@ class SDFConditioner(Conditioner):
         )
         # sdf potential
         _, sdfs, _ = self.voxel_grid.find_nearest_voxels(X[:,:,0,:], method='nearest')
+        self.sdfs.append(torch.clamp(sdfs, 0).mean(-1).detach().cpu().numpy()[0])
+        self.D_ws.append((T_w * D_inter).sum([-1,-2]).detach().cpu().numpy()[0])
         
         # unconditional to points inside X_target
         sdfs = torch.clamp(sdfs, 0, 0.2) + 1 # upto 20% boost
