@@ -156,6 +156,7 @@ def main():
     return
 
 if __name__=='__main__':
+    # register YOUR key
     api.register_key("b287b5c091514189ab14cf0b55b795bb")
     device="cuda" if torch.cuda.is_available() else 'cpu'
     print(f'Device is {device}')
@@ -163,8 +164,9 @@ if __name__=='__main__':
     print('Loading weights')
     start_time = time.time()
     chroma = Chroma(
-        weights_backbone='/home/annung202/chroma/assets/chroma_weights/chroma_backbone_v1.0.pt', 
-        weights_design='/home/annung202/chroma/assets/chroma_weights/chroma_design_v1.0.pt'
+        # if you cant connect to internet
+        # weights_backbone='/home/annung202/chroma/assets/chroma_weights/chroma_backbone_v1.0.pt', 
+        # weights_design='/home/annung202/chroma/assets/chroma_weights/chroma_design_v1.0.pt'
     ).to(device)
     loading_time = time.time() - start_time
     print(f'Weights loading time: {loading_time:.2f} seconds')
